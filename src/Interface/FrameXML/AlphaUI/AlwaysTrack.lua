@@ -9,15 +9,22 @@ local mainAlwaysTrackBookTypes = {
 }
 
 local mainAlwaysTrackTrackedSpells = {
-	{ label = "Find Herbs", spellName = "Find Herbs", spellId = 2383 },
-	{ label = "Find Minerals", spellName = "Find Minerals", spellId = 2580 },
-	{ label = "Find Treasure", spellName = "Find Treasure", spellId = 2481 },
+	{ label = "Find Herbs", spellName = "Find Herbs", spellId = 2383, textures = { "Interface\\Icons\\Spell_Nature_NatureTouchGrow" } },
+	{ label = "Find Minerals", spellName = "Find Minerals", spellId = 2580, textures = { "Interface\\Icons\\Spell_Nature_Earthquake" } },
+	{ label = "Find Treasure", spellName = "Find Treasure", spellId = 2481, textures = { "Interface\\Icons\\Racial_Dwarf_FindTreasure" } },
 }
 
 local mainAlwaysTrackKnownSpells = {}
 local mainAlwaysTrackHasKnownSpell = nil
 local mainAlwaysTrackRetryAt = nil
 local MAIN_ALWAYS_TRACK_RETRY_BUFFER_SECONDS = 0.2
+local MAIN_ALWAYS_TRACK_BUFF_FILTER = "HELPFUL|PASSIVE"
+local MAIN_ALWAYS_TRACK_FIND_TREASURE_SPELL_ID = 2481
+local MAIN_ALWAYS_TRACK_CAST_ERROR_WINDOW_SECONDS = 1
+local mainAlwaysTrackLastCastSpellId = nil
+local mainAlwaysTrackLastCastAt = nil
+local mainAlwaysTrackFindTreasureNeedsStand = nil
+local MainAlwaysTrack_EnsureTracking
 
 local function MainAlwaysTrack_IsPlayerDead()
 	if UnitIsDead and UnitIsDead("player") then
@@ -89,6 +96,7 @@ local function MainAlwaysTrack_RefreshKnownSpells()
 				slot = slot,
 				bookType = bookType,
 				texture = texture,
+				textures = spellInfo.textures,
 			})
 			hasKnownSpell = 1
 		end
@@ -113,7 +121,7 @@ local function MainAlwaysTrack_GetActiveBuffTextures()
 	end
 
 	for buffIndex = 0, 15 do
-		activeBuffIndex = GetPlayerBuff(buffIndex, "HELPFUL")
+		activeBuffIndex = GetPlayerBuff(buffIndex, MAIN_ALWAYS_TRACK_BUFF_FILTER)
 		if activeBuffIndex and activeBuffIndex >= 0 then
 			buffTexture = GetPlayerBuffTexture(activeBuffIndex)
 			if buffTexture then
@@ -123,6 +131,30 @@ local function MainAlwaysTrack_GetActiveBuffTextures()
 	end
 
 	return activeTextures
+end
+
+local function MainAlwaysTrack_IsSpellTextureActive(knownSpell, activeBuffTextures)
+	local textureIndex
+	local texture
+
+	if not knownSpell or not activeBuffTextures then
+		return nil
+	end
+
+	if knownSpell.texture and activeBuffTextures[knownSpell.texture] then
+		return 1
+	end
+
+	if knownSpell.textures then
+		for textureIndex = 1, Main_ArrayCount(knownSpell.textures) do
+			texture = knownSpell.textures[textureIndex]
+			if texture and activeBuffTextures[texture] then
+				return 1
+			end
+		end
+	end
+
+	return nil
 end
 
 local function MainAlwaysTrack_GetMissingKnownSpells()
@@ -137,7 +169,7 @@ local function MainAlwaysTrack_GetMissingKnownSpells()
 	for spellIndex = 1, Main_ArrayCount(mainAlwaysTrackKnownSpells) do
 		knownSpell = mainAlwaysTrackKnownSpells[spellIndex]
 		if knownSpell and knownSpell.slot and knownSpell.bookType then
-			if not knownSpell.texture or not activeBuffTextures[knownSpell.texture] then
+			if not MainAlwaysTrack_IsSpellTextureActive(knownSpell, activeBuffTextures) then
 				Main_ArrayInsert(missingSpells, knownSpell)
 			end
 		end
@@ -192,7 +224,47 @@ local function MainAlwaysTrack_GetReadyAt(knownSpell)
 	return startTime + duration + MAIN_ALWAYS_TRACK_RETRY_BUFFER_SECONDS
 end
 
-local function MainAlwaysTrack_EnsureTracking()
+local function MainAlwaysTrack_IsNotStandingError(message)
+	if not message or message == "" then
+		return nil
+	end
+
+	if SPELL_FAILED_NOTSTANDING and message == SPELL_FAILED_NOTSTANDING then
+		return 1
+	end
+
+	return nil
+end
+
+local function MainAlwaysTrack_OnErrorMessage()
+	local message
+	local now
+
+	message = arg1
+	if not MainAlwaysTrack_IsNotStandingError(message) then
+		return
+	end
+	if mainAlwaysTrackLastCastSpellId ~= MAIN_ALWAYS_TRACK_FIND_TREASURE_SPELL_ID then
+		return
+	end
+
+	now = GetTime and GetTime() or 0
+	if mainAlwaysTrackLastCastAt and (now - mainAlwaysTrackLastCastAt) <= MAIN_ALWAYS_TRACK_CAST_ERROR_WINDOW_SECONDS then
+		mainAlwaysTrackFindTreasureNeedsStand = 1
+		mainAlwaysTrackRetryAt = nil
+	end
+end
+
+local function MainAlwaysTrack_OnPlayerStand()
+	if not mainAlwaysTrackFindTreasureNeedsStand then
+		return
+	end
+
+	mainAlwaysTrackFindTreasureNeedsStand = nil
+	MainAlwaysTrack_EnsureTracking()
+end
+
+MainAlwaysTrack_EnsureTracking = function()
 	local now
 	local missingSpells
 	local spellIndex
@@ -217,8 +289,10 @@ local function MainAlwaysTrack_EnsureTracking()
 		knownSpell = missingSpells[spellIndex]
 		readyAt = MainAlwaysTrack_GetReadyAt(knownSpell)
 		if not readyAt or readyAt <= now then
-			spellToCast = knownSpell
-			break
+			if knownSpell.spellId ~= MAIN_ALWAYS_TRACK_FIND_TREASURE_SPELL_ID or not mainAlwaysTrackFindTreasureNeedsStand then
+				spellToCast = knownSpell
+				break
+			end
 		end
 		if not nextReadyAt or readyAt < nextReadyAt then
 			nextReadyAt = readyAt
@@ -226,6 +300,8 @@ local function MainAlwaysTrack_EnsureTracking()
 	end
 
 	if spellToCast then
+		mainAlwaysTrackLastCastSpellId = spellToCast.spellId
+		mainAlwaysTrackLastCastAt = now
 		mainAlwaysTrackRetryAt = now + MAIN_ALWAYS_TRACK_RETRY_BUFFER_SECONDS
 		CastSpell(spellToCast.slot, spellToCast.bookType)
 		return
@@ -252,6 +328,8 @@ function MainAlwaysTrack:Init()
 	Main.RegisterEventHandler("PLAYER_ENTERING_WORLD", "always_track_entering_world", MainAlwaysTrack_OnWorldOrAuraChanged)
 	Main.RegisterEventHandler("PLAYER_AURAS_CHANGED", "always_track_auras_changed", MainAlwaysTrack_OnWorldOrAuraChanged)
 	Main.RegisterEventHandler("SPELLS_CHANGED", "always_track_spells_changed", MainAlwaysTrack_OnSpellsChanged)
+	Main.RegisterEventHandler("UI_ERROR_MESSAGE", "always_track_ui_error", MainAlwaysTrack_OnErrorMessage)
+	Main.RegisterEventHandler("PLAYER_STAND", "always_track_player_stand", MainAlwaysTrack_OnPlayerStand)
 end
 
 function MainAlwaysTrack:Enable()
@@ -261,6 +339,9 @@ end
 
 function MainAlwaysTrack:Disable()
 	mainAlwaysTrackRetryAt = nil
+	mainAlwaysTrackLastCastSpellId = nil
+	mainAlwaysTrackLastCastAt = nil
+	mainAlwaysTrackFindTreasureNeedsStand = nil
 end
 
 function MainAlwaysTrack:ApplyConfig()
